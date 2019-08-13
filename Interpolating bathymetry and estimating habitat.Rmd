@@ -1,0 +1,310 @@
+---
+title: "Interpolating Bathymetry and Estimating Habitat"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+In this R notebook, we will calculate the percentage of adult bottomfish habitat (100-400m) in each of Hawaii's statistical fishery reporting areas, and calculate the fraction of that habitat that is protected by the Bottomfish Restricted Fishing Area (BRFA) network. 
+
+However, the 50m bathymetry we will use to do this is missing values for some key areas. We will first need to gap fill the missing bathymetry values. 
+
+### Setup
+First we set up our workspace enviornment including loading all required packages, our data files, and setting a timer for our script
+```{r}
+## Starting Script Timer
+sTimer = proc.time()
+
+## Establishing working directory
+proj_dir = "/Volumes/GoogleDrive/My Drive/Weng Lab/Personal_Folders/Steve/dissertation work/Ch 5. BACIP Analysis"
+
+## Loading Packages
+library('marmap')
+library('doParallel')
+library('beepr')
+library('spatial.tools')
+library('maptools')
+library('rgdal')
+library('raster')
+
+#### Loading Spatial Data
+bty_50 = raster(file.path(proj_dir, 'data/himbsyn.bathy.v19.grd')) #bathymetry at 60m resolution
+bty_1 = raster(file.path(proj_dir, 'data/himbsyn.bathytopo.1km.v19.grd')) #bathymetry at 1km resolution
+coast = readOGR(file.path(proj_dir, 'data/coast/coast_n83.shp')) #coastline
+
+brfa08 = readOGR(file.path(proj_dir, 'data/brfa07/BRFA_Closed.shp')) #current BRFA placements
+brfa99 = readShapePoly(file.path(proj_dir, 'data/brfa98/MHIRFAs.shp')) #old BRFA placements
+stat_grids = readOGR(file.path(proj_dir, 'data/mhi_brfa_fishgrid_map.mpk Folder/commondata/regs/Fishchart2008.shp'))
+```
+
+### Cleaning spatial data
+Now we need to get our spatial data into a similar projection. 
+
+We'll adjust the crs of our bathymetry sources and plot them along with the statistical grids to ensure they properly overlap. 
+
+Finally, We'll also mask off our raster data so we're not doing interpolation over the entire map (which is very large) but instead over a subset that we're interested in.
+```{r}
+### Adjusting bathymetry CRS
+crs(bty_1)<-crs(bty_50)
+
+### Plotting bathymetry data overlayed with statistical grids 
+plot(bty_50)
+plot(stat_grids, border = 'black', add = T)
+
+plot(bty_1)
+plot(stat_grids, border = 'black', add = T)
+
+#### Modifying the extent of our raster objects
+### Creating a new extent object for the bbox_to_SpatialPolygons function
+ext_obj = extent(bty_50)
+ext_obj@xmin = -160 
+ext_obj@xmax = -154.13
+ext_obj@ymin = 18.33 
+ext_obj@ymax = 23
+
+### Masking off our raster file
+ mhi_bbox = bbox_to_SpatialPolygons(extent(bty_1), proj4string = crs(bty_50))
+ bty_1 = mask(x = bty_1, mask = mhi_bbox)
+ bty_50 = mask(x = bty_50, mask = mhi_bbox)
+```
+
+
+### Interpolating Missing Raster Data
+Now that our data is alligned, we'll use the 1km bathymetry to fill in missing values in the 50m bathymetry. We do this by first resampling the 1km set using the 50m raster as a template. This will chop the 1km set up into 50m subsections, though each 20x20 pixel region will have the same value as the overlayed 1km data. 
+
+Then we will fill in our missing 50m values with the values from the resampled 1km data
+```{r}
+## Resample 1 km to 50 m
+ bty_1_resample = raster::resample(x = bty_1, y = bty_50, method = 'ngb')
+
+ na_ind_50 = is.na(getValues(bty_50))
+ bty_50_2 = bty_50
+ bty_50_2[na_ind_50] = bty_1_resample[na_ind_50]
+ 
+```
+
+
+We've filled in our missing NA values, but as mentioned, the 20x20 pixel regions we've filled are uniform in depth because they were smapled from the 1km grid.
+
+We can smooth out all of this using bilinear interpolation. This will produce a smoothed continuous bathymetry surface that models  depth across those missing pixel regions. 
+
+This is done by resampling our combined data set using a blank raster template of identical dimensions.
+
+After we have smoothed our data, we'll replace the NA values missing from the original 50m data with the smoothed interpolated values while we retain the known values values from the original data. We'll save our final raster out so we never have to do this again.
+```{r}
+### Make new raster from interpolated 50m set with only interpolated points from 1km resample raster
+ bty_50_empty = bty_50
+ bty_50_empty[!is.na(bty_50_empty)] = NA
+ 
+### Using bilinear interpolation to resample the entire composited map (50m gap filled with 1km)
+  bty_50_resample_all = raster::resample(x = bty_50_2, bty_50_empty, method = "bilinear")
+  
+## Now combine resampled and interpolated 50m back with 50m data we know is good
+  bty_50_composited_by_bty_50_resample = bty_50
+  bty_50_composited_by_bty_50_resample[na_ind_50] = bty_50_resample_all[na_ind_50]
+  
+### Plotting our composited bathymetry raster
+  plot(bty_50_composited_by_bty_50_resample)
+  
+### Save our composited raster data
+writeRaster(bty_50_composited_by_bty_50_resample, file.path(proj_dir, '50m Bathy Resampled from Mosaic'))
+bty = bty_50_composited_by_bty_50_resample
+```
+
+We've now successfully gap filled our missing bathymetry!
+
+### Calculating Habitat in Each Reporting Area
+Now we will calculate the habitat (100 - 400m) in each statistical reporting grid as well as the amount of habitat that is protected under each BRFA management regime.
+
+We'll begin by getting our data into the same CRS object, removing offshore statistical grids we know do not have any bottomfish habitat, and then plotting everything on top of one another to make sure our data remains aligned.
+```{r}
+### Reproject stat_grids
+bty = projectRaster(bty, crs = '+proj=utm +zone=4 +datum=WGS84 +units=m +no_defs +ellps=WGS84 +towgs84=0,0,0 ')
+stat_grids = spTransform(stat_grids, CRSobj = crs(bty))
+
+## Remove statistical reporting grids we don't care about
+reporting_grids_to_keep = c(100:128, 300:333, 351, 400:429, 452,500:528)
+stat_grids = stat_grids[stat_grids$AREA_ID %in% reporting_grids_to_keep, ]
+
+## Plot everything to make sure it looks right
+pdf('Plot of Reporting Grids, BRFAs, and Bathy.pdf', width = 11, height = 8)
+plot(bty)
+plot(stat_grids, border = 'black', add = T)
+plot(coast, col= 'tan', add = T)
+plot(brfa99, lwd = 2, add = T, border = 'red')
+plot(brfa08, add = T, lwd = 2, border = 'purple')
+dev.off()
+```
+
+
+Next we loop through each statistical area to calculate the amount of total and protected habitat contained within.
+
+We start by defining our depth strata in 50m increments. Then we'll use the union function to subdivide our statistical grid and BRFA boundary shapefiles. This will create a single object with subdivided reporting areas for protected and non-protected habitat
+```{r}
+## Defining our the depth cuts that bound each of our depth strata
+depth_cuts = seq(0, -500, by = -50)
+
+#### 1999 
+## Subdivide our stats grid to include BRFA Boundaries
+stat_grids_by_brfa99 = union(stat_grids, brfa99)
+## NA names throw an error so we'll just call them "NA" so we can find them later
+stat_grids_by_brfa99$AREA_ID[is.na(stat_grids_by_brfa99$AREA_ID)] = 'NA'
+```
+
+Now we'll loop through each repoting grid to calculate the total and protected habitat contained within. We we set up dataframe for our results and then extract all bathymetry values under each reporting grid shapefile. 
+
+The shapefiles contain the amount of squared area contained within so to calculate the area, we multiply the total area by the percentage of cells matching a given depth strata. 
+
+For example, if an reporting area is 10km in size and 20% of cell values are within 50 and 100m, then we can say that area contains 5km of habitat between 50 and 100m. We then do the same thing using only the shapefiles that are "protected" as defined by the ID column.
+
+We'll also divide the protected habitat area by total habitat area to get the % protected habitat.
+
+For each reporting area, we'll write the amount of habitat back to our results data frame and then save our results for future analysis.
+```{r}
+## Creating output dataframe
+reporting_areas_1999 = data.frame(stringsAsFactors = FALSE)
+
+## Looping through each reporting area
+for(i in 1:length(unique(stat_grids$AREA_ID))){ 
+  print(paste(i, 'of', length(unique(stat_grids$AREA_ID))))
+  area_data = c()
+  area_id = unique(stat_grids$AREA_ID)[i]
+  
+  ## Calculating total area for the entire reporting grid
+  total_grid_area = sum(area(stat_grids[stat_grids$AREA_ID == area_id, ])) *10^-6 # in km2
+  ## Getting all data associated with this grid
+  all_grid_data = unlist(extract(bty, stat_grids_by_brfa99[stat_grids_by_brfa99$AREA_ID == area_id, ]))
+  
+  ### Calculating total habitat area in slices
+  habitat_area_by_depth = as.data.frame(matrix(data = 0, nrow = 1, ncol = length(depth_cuts)-1))
+  habitat_area_colnames = c()
+  for(j in 2:length(depth_cuts)){
+    ## Get the area within each depth slice by calculating the number of cells meeting depth requirements, then dividing by the number of total cells to get % in depth range, then multiply by total area
+    habitat_area_by_depth[j-1] = length(all_grid_data[all_grid_data <= depth_cuts[j-1] & all_grid_data > depth_cuts[j] & !is.na(all_grid_data)]) / length(all_grid_data) * total_grid_area
+    habitat_area_colnames = c(habitat_area_colnames, paste('habitat_area_total', abs(depth_cuts[j-1]), abs(depth_cuts[j]), sep = "_"))
+  }
+  ## Assigning generated column names
+  colnames(habitat_area_by_depth) = habitat_area_colnames
+  
+  ### Calculating BRFA habitat area in slices
+  brfa_habitat_area_by_depth = as.data.frame(matrix(data = 0, nrow = 1, ncol = length(depth_cuts)-1))
+  brfa_habitat_area_colnames = c()
+  ## If a reporting grid has a BRFA
+  if(dim(stat_grids_by_brfa99[stat_grids_by_brfa99$AREA_ID == area_id & !is.na(stat_grids_by_brfa99$ID), ])[1] > 0){
+    ## Loop through each depth strata and calculate the number of cells within.
+    for(j in 2:length(depth_cuts)){
+      brfa_bathy_data = unlist(extract(bty, stat_grids_by_brfa99[stat_grids_by_brfa99$AREA_ID == area_id & !is.na(stat_grids_by_brfa99$ID), ]))
+      ## Calculating total area of each strata by computing the % of total cells falling within that strata and multiplying it by total calculated
+      brfa_habitat_area_by_depth[j-1] = length(brfa_bathy_data[brfa_bathy_data <= depth_cuts[j-1] & brfa_bathy_data > depth_cuts[j] & !is.na(brfa_bathy_data)]) / length(all_grid_data) * total_grid_area
+      ## get our column names that define each strata
+      brfa_habitat_area_colnames = c(brfa_habitat_area_colnames, paste('habitat_area_brfa', abs(depth_cuts[j-1]), abs(depth_cuts[j]), sep = "_"))
+    }
+  } else {
+    ## We still need to get our column names that define each strata
+    for(j in 2:length(depth_cuts)){
+      brfa_habitat_area_colnames = c(brfa_habitat_area_colnames, paste('habitat_area_brfa', abs(depth_cuts[j-1]), abs(depth_cuts[j]), sep = "_"))
+    }
+  }
+  ## Assigning generated column names
+  colnames(brfa_habitat_area_by_depth) = brfa_habitat_area_colnames
+  
+  ## Writing out data frame
+  reporting_areas_1999 = rbind(reporting_areas_1999, data.frame('grid' = area_id, 'habitat_area_total' = sum(habitat_area_by_depth), habitat_area_by_depth, 'habitat_area_brfa_total' = sum(brfa_habitat_area_by_depth), brfa_habitat_area_by_depth))
+}
+
+## getting percent of adult habitat (100-400m) in each reporting area that's protected 
+reporting_areas_1999$percent_protected_1999 = rowSums(reporting_areas_1999[ ,which(grepl('habitat_area_brfa_', colnames(reporting_areas_1999)) & !grepl('brfa_0', colnames(reporting_areas_1999)) & !grepl('brfa_500', colnames(reporting_areas_1999)) & !grepl('habitat_area_brfa_total', colnames(reporting_areas_1999)) & !grepl('brfa_450', colnames(reporting_areas_1999)))]) / 
+  rowSums(reporting_areas_1999[ ,which(grepl('habitat_area_total_', colnames(reporting_areas_1999)) & !grepl('total_0', colnames(reporting_areas_1999)) & !grepl('total_500', colnames(reporting_areas_1999)) & !grepl('total_450', colnames(reporting_areas_1999)))])
+reporting_areas_1999$percent_protected_1999[is.nan(reporting_areas_1999$percent_protected_1999)] = 0
+## Writing out file if percent protected ranges between 0 and 1 and no BRFA habitat is greater than total habitat
+
+if(max(range(reporting_areas_1999$percent_protected_1999)) <= 1 & min(range(reporting_areas_1999$percent_protected_1999)) >= 0 & all(reporting_areas_1999$habitat_area_total >= reporting_areas_1999$habitat_area_brfa_total)) {
+  ## Reordering our reporting areas by area id (grid)
+  reporting_areas_1999 = reporting_areas_1999[order(as.numeric(reporting_areas_1999$grid)), ]
+  ## Writing out our dataframe as a .csv file
+  write.csv(reporting_areas_1999, file.path(proj_dir, "data/reporting_grid_1999_area_data.csv"), row.names = F)
+} else {
+  print('Error with 1999 reporting areas')
+  beep(1)
+}
+```
+
+
+Now we repeat this same process for the 2008 revised BRFA network.
+```{r}
+## Subdivide our stats grid to include BRFA Boundaries
+stat_grids_by_brfa08 = union(stat_grids, brfa08)
+## NA names throw an error so we'll just call them "NA" so we can find them later
+stat_grids_by_brfa08$AREA_ID[is.na(stat_grids_by_brfa08$AREA_ID)] = 'NA'
+
+## Looping through each reporting grid
+reporting_areas_2008 = data.frame(stringsAsFactors = F)
+# foreach(i = 1:length(unique(stat_grids$AREA_ID)), .combine = rbind) %dopar% {
+for(i in 1:length(unique(stat_grids$AREA_ID))){ ; print(paste(i, 'of', length(unique(stat_grids$AREA_ID))))
+  area_data = c()
+  area_id = unique(stat_grids$AREA_ID)[i]
+  
+  ## Calculating total area for the entire reporting grid
+  total_grid_area = sum(area(stat_grids[stat_grids$AREA_ID == area_id, ])) *10^-6 # in km2
+  ## Getting all data associated with this grid
+  all_grid_data = unlist(extract(bty, stat_grids_by_brfa08[stat_grids_by_brfa08$AREA_ID == area_id, ]))
+  
+  ### Calculating total habitat area in slices
+  habitat_area_by_depth = as.data.frame(matrix(data = 0, nrow = 1, ncol = length(depth_cuts)-1))
+  habitat_area_colnames = c()
+  for(j in 2:length(depth_cuts)){
+    ## Get the area within each depth slice by calculating the number of cells meeting depth requirements, then dividing by the number of total cells to get % in depth range, then multiply by total area
+    habitat_area_by_depth[j-1] = length(all_grid_data[all_grid_data <= depth_cuts[j-1] & all_grid_data > depth_cuts[j] & !is.na(all_grid_data)]) / length(all_grid_data) * total_grid_area
+    habitat_area_colnames = c(habitat_area_colnames, paste('habitat_area_total', abs(depth_cuts[j-1]), abs(depth_cuts[j]), sep = "_"))
+  }
+  colnames(habitat_area_by_depth) = habitat_area_colnames
+  
+  ### Calculating BRFA habitat area in slices
+  brfa_habitat_area_by_depth = as.data.frame(matrix(data = 0, nrow = 1, ncol = length(depth_cuts)-1))
+  brfa_habitat_area_colnames = c()
+  ## If a reporting grid has a BRFA
+  if(dim(stat_grids_by_brfa08[stat_grids_by_brfa08$AREA_ID == area_id & !is.na(stat_grids_by_brfa08$BRFA_Let), ])[1] > 0){
+    ## Loop through each depth strata and calculate the number of cells within.
+    for(j in 2:length(depth_cuts)){
+      brfa_bathy_data = unlist(extract(bty, stat_grids_by_brfa08[stat_grids_by_brfa08$AREA_ID == area_id & !is.na(stat_grids_by_brfa08$BRFA_Let), ]))
+      ## Calculating total area of each strata by computing the % of total cells falling within that strata and multiplying it by total calculated
+      brfa_habitat_area_by_depth[j-1] = length(brfa_bathy_data[brfa_bathy_data <= depth_cuts[j-1] & brfa_bathy_data > depth_cuts[j] & !is.na(brfa_bathy_data)]) / length(all_grid_data) * total_grid_area
+      ## get our column names that define each strata
+      brfa_habitat_area_colnames = c(brfa_habitat_area_colnames, paste('habitat_area_brfa', abs(depth_cuts[j-1]), abs(depth_cuts[j]), sep = "_"))
+    }
+  } else {
+    ## We still need to get our column names that define each strata
+    for(j in 2:length(depth_cuts)){
+      brfa_habitat_area_colnames = c(brfa_habitat_area_colnames, paste('habitat_area_brfa', abs(depth_cuts[j-1]), abs(depth_cuts[j]), sep = "_"))
+    }
+  }
+  colnames(brfa_habitat_area_by_depth) = brfa_habitat_area_colnames
+  
+  #return(data.frame('grid' = area_id, 'habitat_area_total' = sum(habitat_area_by_depth), habitat_area_by_depth, 'habitat_area_brfa_total' = sum(brfa_habitat_area_by_depth), brfa_habitat_area_by_depth))
+  reporting_areas_2008 = rbind(reporting_areas_2008, data.frame('grid' = area_id, 'habitat_area_total' = sum(habitat_area_by_depth), habitat_area_by_depth, 'habitat_area_brfa_total' = sum(brfa_habitat_area_by_depth), brfa_habitat_area_by_depth))
+}
+
+## getting percent of adult habitat (100-400m) in each reporting area that's protected 
+reporting_areas_2008$percent_protected_2008 = rowSums(reporting_areas_2008[ ,which(grepl('habitat_area_brfa_', colnames(reporting_areas_2008)) & !grepl('brfa_0', colnames(reporting_areas_2008)) & !grepl('brfa_500', colnames(reporting_areas_2008)) & !grepl('habitat_area_brfa_total', colnames(reporting_areas_2008)) & !grepl('brfa_450', colnames(reporting_areas_2008)))]) / 
+  rowSums(reporting_areas_2008[ ,which(grepl('habitat_area_total_', colnames(reporting_areas_2008)) & !grepl('total_0', colnames(reporting_areas_2008)) & !grepl('total_500', colnames(reporting_areas_2008)) & !grepl('total_450', colnames(reporting_areas_2008)))])
+reporting_areas_2008$percent_protected_2008[is.nan(reporting_areas_2008$percent_protected_2008)] = 0
+## Reordering our reporting areas by area id (grid)
+reporting_areas_2008 = reporting_areas_2008[order(as.numeric(reporting_areas_2008$grid)), ]
+
+## Writing out file if percent protected ranges between 0 and 1 and no BRFA habitat is greater than total habitat
+if(max(range(reporting_areas_2008$percent_protected_2008)) <= 1 & min(range(reporting_areas_2008$percent_protected_2008)) >= 0 & all(reporting_areas_2008$habitat_area_total >= reporting_areas_2008$habitat_area_brfa_total)) {
+  ## Writing out our dataframe as a .csv file
+  write.csv(reporting_areas_2008, file.path(proj_dir, "data/reporting_grid_2008_area_data.csv"), row.names = F)
+} else {
+  print('Error with 2008 reporting areas')
+  beep(1)
+}
+```
+
+### Cleanup
+And we're done! In this final chunk we'll calculate how long it took our script to run and send a notification to my phone so that I know everything ran successfully. 
+```{r}
+
+run_time = (proc.time()[3] - sTimer[3]) / 60
+send_push(user = 'uGEHvA4hr37tsrCCtpSv4sUUxVuTqN', message = paste('Habitat area by stat grids and BRFAs calculated in:', run_time, ' minutes', sep = ""))
+```
